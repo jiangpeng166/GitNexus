@@ -1764,6 +1764,102 @@ export const DART_QUERIES = `
   right: (_)) @assignment
 `;
 
+// ─── Objective-C ────────────────────────────────────────────────────────────
+// tree-sitter-objc is a superset of tree-sitter-c. These queries capture OC
+// class/protocol/method/property/function definitions and imports for the
+// generic definition extractor. Scope-resolution (CALLS/EXTENDS/IMPLEMENTS/
+// Process edges) is driven separately by `emitObjCScopeCaptures` in
+// languages/objectivec/ (OC_SCOPE_QUERY), which is richer than this table —
+// keep the two in sync when node-type handling changes.
+export const OBJC_QUERIES = `
+; === Classes (@interface declarations) ===
+; Anchor to "@interface" keyword so the first identifier (class name)
+; is always captured — prevents Category names from overriding in
+; files like Foo+Bar.m where the second identifier is the category name.
+(class_interface
+  "@interface" . (identifier) @name) @definition.class
+
+; Anchor to "@implementation" — same reason as above for Category
+; implementations.
+(class_implementation
+  "@implementation" . (identifier) @name) @definition.class
+
+; === Protocols ===
+(protocol_declaration
+  (identifier) @name) @definition.interface
+
+; === Methods (declarations in @interface) ===
+(method_declaration
+  (method_type)
+  (identifier) @name) @definition.method
+
+; === Methods (implementations in @implementation) ===
+(implementation_definition
+  (method_definition
+    (method_type)
+    (identifier) @name)) @definition.method
+
+; === Properties ===
+; Non-pointer type: int count; / id<Proto> delegate;
+(property_declaration
+  (struct_declaration
+    (struct_declarator
+      (identifier) @name))) @definition.property
+
+; Pointer type: UIView *mainView; / NSArray<T> *items;
+(property_declaration
+  (struct_declaration
+    (struct_declarator
+      (pointer_declarator
+        (identifier) @name)))) @definition.property
+
+; Block type: void (^completionBlock)(void);
+(property_declaration
+  (struct_declaration
+    (struct_declarator
+      (function_declarator
+        (parenthesized_declarator
+          (block_pointer_declarator
+            (identifier) @name)))))) @definition.property
+
+; === C functions in OC files ===
+(function_definition
+  (function_declarator
+    (identifier) @name)) @definition.function
+
+; === Imports (#import and #include) ===
+(preproc_include
+  (string_literal) @import.source) @import
+
+; === Heritage (class inheritance) ===
+; @interface ClassName : ParentClass
+(class_interface
+  "@interface" . (identifier) @heritage.class
+  ":"
+  (identifier) @heritage.extends) @heritage
+
+; @interface ClassName : ParentClass <Protocol1, Protocol2>
+(class_interface
+  "@interface" . (identifier) @heritage.class
+  ":"
+  (identifier) @heritage.extends
+  (parameterized_arguments) @heritage.oc-protocols) @heritage
+
+; @interface ClassName <Protocol1, Protocol2>  (no parent class)
+(class_interface
+  "@interface" . (identifier) @heritage.class
+  (parameterized_arguments) @heritage.oc-protocols) @heritage
+
+; @protocol ProtocolName <ParentProtocol1, ParentProtocol2>
+(protocol_declaration
+  (identifier) @heritage.class
+  (protocol_reference_list) @heritage.oc-protocols) @heritage
+
+; === Calls (message expressions) ===
+; [receiver method:arg ...] — captured as @call, processed by extractLanguageCallSite
+(message_expression) @call
+`;
+
 import { SupportedLanguages } from 'gitnexus-shared';
 
 export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
@@ -1783,4 +1879,5 @@ export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Dart]: DART_QUERIES,
   [SupportedLanguages.Vue]: TYPESCRIPT_QUERIES, // Vue <script> blocks are parsed as TypeScript
   [SupportedLanguages.Cobol]: '', // Standalone regex processor — no tree-sitter queries
+  [SupportedLanguages.ObjectiveC]: OBJC_QUERIES,
 };

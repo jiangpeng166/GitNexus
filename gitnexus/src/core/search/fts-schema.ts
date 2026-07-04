@@ -22,7 +22,6 @@ const FTS_PROPERTIES = ['name', 'content', 'description'] as const;
 export const FTS_INDEXES: readonly FTSIndexDefinition[] = [
   // File has no `description` column — keep it name+content only.
   { table: 'File', indexName: 'file_fts', properties: ['name', 'content'] },
-  // Original 5 (minus File) gain `description`.
   { table: 'Function', indexName: 'function_fts', properties: FTS_PROPERTIES },
   { table: 'Class', indexName: 'class_fts', properties: FTS_PROPERTIES },
   { table: 'Method', indexName: 'method_fts', properties: FTS_PROPERTIES },
@@ -44,4 +43,9 @@ export const FTS_INDEXES: readonly FTSIndexDefinition[] = [
   { table: 'Union', indexName: 'union_fts', properties: FTS_PROPERTIES },
   { table: 'Static', indexName: 'static_fts', properties: FTS_PROPERTIES },
   { table: 'Variable', indexName: 'variable_fts', properties: FTS_PROPERTIES },
+  // Process has no `name`/`content`/`description` columns — index `processType`
+  // (its only textual column) so Process nodes are reachable via FTS. Note this
+  // only discriminates by community type; rich Chinese/English Process search is
+  // served by the cluster_fallback path in local-backend, not this index.
+  { table: 'Process', indexName: 'process_fts', properties: ['processType'] },
 ];

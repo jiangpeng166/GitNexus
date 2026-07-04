@@ -25,6 +25,7 @@ interface HttpConfig {
   model: string;
   apiKey: string;
   dimensions?: number;
+  noDimsParam: boolean;
 }
 
 /**
@@ -68,12 +69,17 @@ const readConfig = (): HttpConfig | null => {
     }
     dimensions = parsed;
   }
+  // #fix: GITNEXUS_EMBEDDING_NO_DIMS_PARAM=1 — don't send the `dimensions` field
+  // to the embedding endpoint. Fixed-dimension HTTP embedding models (e.g.
+  // BAAI/bge-m3 always returns 1024) reject the `dimensions` field with HTTP 400.
+  const noDimsParam = /^(1|true|yes|on)$/i.test(process.env.GITNEXUS_EMBEDDING_NO_DIMS_PARAM ?? '');
 
   return {
     baseUrl: baseUrl.replace(/\/+$/, ''),
     model,
     apiKey: process.env.GITNEXUS_EMBEDDING_API_KEY ?? 'unused',
     dimensions,
+    noDimsParam,
   };
 };
 
@@ -308,7 +314,7 @@ export const httpEmbed = async (texts: string[]): Promise<Float32Array[]> => {
       config.model,
       config.apiKey,
       batchIndex,
-      config.dimensions,
+      config.noDimsParam ? undefined : config.dimensions,
     );
 
     if (items.length !== batch.length) {
@@ -358,7 +364,7 @@ export const httpEmbedQuery = async (text: string): Promise<number[]> => {
     config.model,
     config.apiKey,
     0,
-    config.dimensions,
+    config.noDimsParam ? undefined : config.dimensions,
   );
   if (!items.length) {
     throw new HttpEmbeddingError(`Embedding endpoint returned empty response (${safeUrl(url)})`);

@@ -177,6 +177,18 @@ const SOURCES: Record<string, GrammarSource> = {
       'Likely cause: no prebuilt `.node` for this platform/architecture. ' +
       `See ${ISSUES_URL}/2107.`,
   },
+  // Objective-C — NOT vendored. tree-sitter-objc is installed as a separate
+  // npm package resolved from node_modules (e.g. `npm install -g
+  // tree-sitter-objc`), so we use createRequire rather than the vendored loader.
+  [SupportedLanguages.ObjectiveC]: {
+    load: () => _require('tree-sitter-objc'),
+    optional: true,
+    userSkippable: true,
+    unavailableNote:
+      'Objective-C parsing disabled: `tree-sitter-objc` is not installed. ' +
+      'Install it (e.g. `npm install -g tree-sitter-objc`) and ensure it is ' +
+      'resolvable from this process — GitNexus does not vendor this grammar.',
+  },
 };
 
 /**

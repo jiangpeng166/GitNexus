@@ -108,6 +108,7 @@ import {
 import { isDebugHeapEnabled, logHeapProbe } from '../utils/heap-probe.js';
 
 import { logger } from '../../logger.js';
+import { mergeOCCategories } from '../languages/oc-category-merger.js';
 // ── Constants ──────────────────────────────────────────────────────────────
 
 /** Max bytes of source content to load per parse chunk.
@@ -1408,6 +1409,18 @@ export async function runChunkedParseAndResolve(
     allExtractedRoutes,
     allDecoratorRoutes,
   );
+
+  // Merge Objective-C Category declarations: @implementation ClassName (Cat)
+  // adds methods to ClassName. Each Category's methods are folded into the
+  // primary Class node (so METHOD_OF/HAS_METHOD edges land on the real class),
+  // while the Category node itself is preserved and linked to the class via a
+  // HAS_CATEGORY edge. Must run after all files are parsed so every Category
+  // and its target class exist in the graph.
+  const ocCategoryMerged = mergeOCCategories(graph);
+  if (isDev && ocCategoryMerged.mergedCount > 0) {
+    logger.debug(`merged ${ocCategoryMerged.mergedCount} Objective-C category group(s)`);
+  }
+
   return {
     exportedTypeMap,
     allFetchCalls,
