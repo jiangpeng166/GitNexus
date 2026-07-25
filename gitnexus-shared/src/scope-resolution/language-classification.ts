@@ -10,7 +10,9 @@
  *   - production: javascript, typescript, python, java, c, cpp, csharp, go,
  *                 ruby, rust, php, kotlin, swift, dart
  *   - experimental: vue (embedded-language / SFC complexity),
- *                   cobol (regex-provider path)
+ *                   cobol (regex-provider path),
+ *                   objectivec (newly ported OC provider; promoted to
+ *                   production after one release cycle stable)
  *   - quarantined: (none)
  */
 
@@ -41,6 +43,7 @@ export const LanguageClassifications: Readonly<Record<SupportedLanguages, Langua
     [SupportedLanguages.Dart]: 'production',
     [SupportedLanguages.Vue]: 'experimental',
     [SupportedLanguages.Cobol]: 'experimental',
+    [SupportedLanguages.ObjectiveC]: 'experimental',
   };
 
 /** Convenience predicate: is this language gating Ring 4 retirement? */

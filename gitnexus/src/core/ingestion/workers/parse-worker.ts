@@ -76,7 +76,22 @@ let C: TreeSitterLanguage | null = null;
 try {
   C = requireVendoredGrammar('tree-sitter-c') as TreeSitterLanguage;
 } catch {}
-import { getLanguageFromFilename } from 'gitnexus-shared';
+
+// Objective-C is NOT a gitnexus npm dependency nor a vendored grammar — it is
+// a separately installed package (e.g. `npm install -g tree-sitter-objc`).
+// Mirror parser-loader.ts: resolve via createRequire(import.meta.url) so the
+// worker thread finds it on the same module-resolution path as the main
+// thread (global node_modules). Without this entry in `languageMap` below,
+// every OC file is classified `unsupported` by the worker and skipped, losing
+// ~88% of nodes/edges (regression observed 2026-07-04). Carried over from the
+// v1.6.7 dist patch (parse-worker.js guarded load + languageMap entry).
+import { createRequire } from 'node:module';
+const _require = createRequire(import.meta.url);
+let ObjectiveC: TreeSitterLanguage | null = null;
+try {
+  ObjectiveC = _require('tree-sitter-objc') as TreeSitterLanguage;
+} catch {}
+import { getLanguageFromFilename, isOCHeaderContent } from 'gitnexus-shared';
 import {
   buildConcreteTypedefDefinitionRanges,
   FUNCTION_NODE_TYPES,
@@ -509,6 +524,7 @@ const languageMap: Record<string, TreeSitterLanguage> = {
   [SupportedLanguages.Java]: Java,
   ...(C ? { [SupportedLanguages.C]: C } : {}),
   [SupportedLanguages.CPlusPlus]: CPP,
+  ...(ObjectiveC ? { [SupportedLanguages.ObjectiveC]: ObjectiveC } : {}),
   [SupportedLanguages.CSharp]: CSharp,
   [SupportedLanguages.Go]: Go,
   [SupportedLanguages.Rust]: Rust,
@@ -957,8 +973,18 @@ const processBatch = (
   // Group by language to minimize setLanguage calls
   const byLanguage = new Map<SupportedLanguages, ParseWorkerInput[]>();
   for (const file of files) {
-    const lang = getLanguageFromFilename(file.path);
+    let lang = getLanguageFromFilename(file.path);
     if (!lang) continue;
+    // .h is ambiguous between Objective-C and C/C++: the extension map assigns
+    // it to ObjectiveC, but a plain C/C++ header has no OC markers. Sniff the
+    // content and downgrade non-OC headers to C++ so they parse with the C/C++
+    // grammar instead of tree-sitter-objc. (Object files in .h with OC content
+    // stay ObjectiveC; empty content defaults to ObjectiveC per isOCHeaderContent.)
+    if (lang === SupportedLanguages.ObjectiveC && file.path.endsWith('.h')) {
+      if (!isOCHeaderContent(file.content)) {
+        lang = SupportedLanguages.CPlusPlus;
+      }
+    }
     let list = byLanguage.get(lang);
     if (!list) {
       list = [];

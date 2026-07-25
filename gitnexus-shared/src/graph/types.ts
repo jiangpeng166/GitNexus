@@ -118,6 +118,12 @@ export type RelationshipType =
   | 'EXTENDS'
   | 'HAS_METHOD'
   | 'HAS_PROPERTY'
+  /** Objective-C Category link: a primary Class node owns a preserved Category
+   *  node (`@implementation ClassName (CategoryName)`). The Category's methods
+   *  are folded into the primary Class, and this edge records the Class→Category
+   *  ownership so the Category node stays queryable. Source = primary Class,
+   *  Target = Category node. */
+  | 'HAS_CATEGORY'
   | 'ACCESSES'
   | 'MEMBER_OF'
   | 'STEP_IN_PROCESS'

@@ -131,9 +131,8 @@ interface SharedDB {
    *  connection enables QUERY_VECTOR_INDEX on every connection of the same
    *  Database. Without this load the pool's vector lane raised a Catalog
    *  exception on every semantic query and silently fell back to the exact
-   *  scan (#2623 follow-up). Optional with `?? false` semantics so the
-   *  construction sites stay minimal. */
-  vectorLoaded?: boolean;
+   *  scan (#2623 follow-up). */
+  vectorLoaded: boolean;
   /** File identity at open — used to detect reuse of a shared read-only handle
    *  whose on-disk index was rebuilt/swapped since it opened (only reachable
    *  when a second pool consumer shares this dbPath; #2614 F2). */
@@ -744,7 +743,13 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
     for (let attempt = 1; attempt <= LOCK_RETRY_ATTEMPTS; attempt++) {
       try {
         const db = await openReadOnlyDatabase(dbPath);
-        shared = { db, refCount: 0, ftsLoaded: false, dbIdentity: await statDbIdentity(dbPath) };
+        shared = {
+          db,
+          refCount: 0,
+          ftsLoaded: false,
+          vectorLoaded: false,
+          dbIdentity: await statDbIdentity(dbPath),
+        };
         dbCache.set(dbPath, shared);
         break;
       } catch (err: any) {
@@ -757,6 +762,7 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
               db,
               refCount: 0,
               ftsLoaded: false,
+              vectorLoaded: false,
               dbIdentity: await statDbIdentity(dbPath),
             };
             dbCache.set(dbPath, shared);
@@ -875,7 +881,7 @@ export async function initLbugWithDb(
   // closeOne() respects the external flag and skips db.close().
   let shared = dbCache.get(dbPath);
   if (!shared) {
-    shared = { db: existingDb, refCount: 0, ftsLoaded: false, external: true };
+    shared = { db: existingDb, refCount: 0, ftsLoaded: false, vectorLoaded: false, external: true };
     dbCache.set(dbPath, shared);
   }
   shared.refCount++;

@@ -230,6 +230,10 @@ export const CLASS_CONTAINER_TYPES = new Set([
   // Go
   'struct_type',
   'interface_type',
+  // Objective-C — @interface and @implementation are the class containers.
+  // (@protocol reuses the existing 'protocol_declaration' entry above.)
+  'class_interface',
+  'class_implementation',
 ]);
 
 export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
@@ -264,6 +268,9 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   companion_object: 'Class',
   struct_type: 'Struct',
   interface_type: 'Interface',
+  // Objective-C
+  class_interface: 'Class',
+  class_implementation: 'Class',
 };
 
 /**

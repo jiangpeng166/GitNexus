@@ -475,6 +475,24 @@ function tryRealpath(p: string): string {
 }
 
 /**
+ * Extract the functional-module name from a source path for symbol-cluster
+ * fallback (#3). In OC the file name equals the class name, so the enclosing
+ * directory segment is the best signal for the feature/module a symbol belongs
+ * to (e.g. `…/FZNDHolding/FZNDHoldingViewController.m` → "FZNDHolding"). Falls
+ * back to the last segment if the path is unusually shallow. Returns '' for
+ * non-string/empty input so callers can default it.
+ */
+function dirSegment(filePath: unknown): string {
+  if (typeof filePath !== 'string' || filePath.length === 0) return '';
+  // Normalise backslashes (defensive) then split on the dominant separator.
+  const parts = filePath.replace(/\\/g, '/').split('/').filter((p) => p.length > 0);
+  if (parts.length < 2) return parts[0] ?? '';
+  // Prefer second-to-last (the dir containing the file) — the file segment
+  // itself is the class name, not the module.
+  return parts[parts.length - 2];
+}
+
+/**
  * Resolve the git diff cwd for detect_changes, auto-detecting linked worktrees.
  *
  * When `launchCwd` is a linked worktree of the same canonical repository as
@@ -2142,6 +2160,71 @@ export class LocalBackend {
 
     timer.stop(); // symbol_lookup
 
+    // Step 2b: Symbol-cluster fallback (#3 — "中文搜 Process 始终为空").
+    //
+    // Root cause is two-layered:
+    //   (a) Process heuristicLabel is an English method-pair ("LoadConfigs → EncodeKey:")
+    //       so Chinese semantic/BM25 search never matches a Process node directly.
+    //   (b) Worse: OC business code (Routers/Controllers/judgement methods like
+    //       isMatchConditionTradeReverseRepurchase:) is overwhelmingly NOT part of
+    //       any Process — process-processor's entry-point heuristic (few callers
+    //       + deep CALLS chains) captures infra flows (network→config→crypto) but
+    //       misses OC's flat business code. So tracing a hit symbol back via
+    //       STEP_IN_PROCESS yields nothing for business queries — everything lands
+    //       in `definitions` and `processes`/`process_symbols` stay empty.
+    //
+    // Rather than fix Process generation (index layer, full re-analyze, its own
+    // problem ≈ P2 #6), synthesise pseudo-Processes here from the hits themselves.
+    // Only kicks in when NO real Process was found, so it never alters results for
+    // queries that DO hit a Process — the success path stays byte-identical.
+    //
+    // Cluster key priority (both fall back to the enclosing module name, which OC
+    // directory layout reliably encodes):
+    //   1. `module`  — Community heuristicLabel (most accurate when present)
+    //   2. directory — second-to-last filePath segment (file name == class name in
+    //                  OC, so the dir segment is the functional module, e.g.
+    //                  …/FZNDHolding/FZNDHoldingViewController.m → "FZNDHolding")
+    // process_type: 'symbol_cluster' marks these as synthetic so downstream
+    // consumers (group/service.js) can distinguish them from real execution flows.
+    if (processMap.size === 0 && definitions.length > 0) {
+      timer.start('cluster_fallback');
+      const clusterMap = new Map<string, any>();
+      for (const def of definitions) {
+        const clusterKey = def.module || dirSegment(def.filePath) || 'other';
+        let cluster = clusterMap.get(clusterKey);
+        if (!cluster) {
+          clusterMap.set(clusterKey, (cluster = {
+            id: `cluster_${clusterKey}`,
+            label: clusterKey,
+            heuristicLabel: clusterKey,
+            processType: 'symbol_cluster',
+            stepCount: 0,
+            totalScore: 0,
+            cohesionBoost: 0,
+            symbols: [],
+          }));
+        }
+        cluster.totalScore += 1; // each hit contributes equally within a cluster
+        cluster.symbols.push({
+          id: def.id,
+          name: def.name,
+          type: def.type,
+          filePath: def.filePath,
+          startLine: def.startLine,
+          endLine: def.endLine,
+          ...(def.module ? { module: def.module } : {}),
+          process_id: cluster.id,
+          step_index: cluster.symbols.length, // stable order = discovery order
+        });
+      }
+      for (const cluster of clusterMap.values()) processMap.set(cluster.id, cluster);
+      // Hits have been promoted to clusters; clear definitions so they don't
+      // duplicate what is now in process_symbols. (definitions still gets its
+      // 20-cap below; it's simply empty here.)
+      definitions.length = 0;
+      timer.stop(); // cluster_fallback
+    }
+
     // Step 3: Rank processes by aggregate score + internal cohesion boost
     timer.start('ranking');
     const rankedProcesses = Array.from(processMap.values())
@@ -2844,6 +2927,104 @@ export class LocalBackend {
   }
 
   /**
+   * Enrich candidate scores with graph-based signals so disambiguation
+   * rankings are meaningful even without file_path / kind hints.
+   *
+   * Best-effort: failures leave existing scores intact.
+   *
+   * Signals:
+   *   - Inbound CALLS count (normalised across the batch)     → up to +0.15
+   *   - Enclosing-class EXTENDS count (more subclasses = core) → up to +0.05
+   *   - File-path depth (fewer directories → more "core")      → up to +0.05
+   *
+   * Single-candidate batches are a no-op (no disambiguation needed).
+   */
+  private async enrichCandidateScores(
+    repo: RepoHandle,
+    scored: Array<{ id: string; filePath?: string; score: number }>,
+  ): Promise<void> {
+    const ids = scored.map((c) => c.id).filter(Boolean);
+    if (ids.length <= 1) return; // nothing to disambiguate
+    try {
+      // 1. Inbound CALLS count per candidate
+      const rows = await executeParameterized(repo.lbugPath, `
+        MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(n)
+        WHERE n.id IN $ids
+        RETURN n.id AS id, COUNT(r) AS inboundCount
+      `, { ids });
+      const inboundByNode = new Map<string, number>();
+      for (const r of rows) {
+        inboundByNode.set((r.id ?? r[0]) as string, Number(r.inboundCount ?? r[1]));
+      }
+      // 2. Normalise: find max inbound count in this batch
+      let maxInbound = 0;
+      for (const count of inboundByNode.values()) {
+        if (count > maxInbound) maxInbound = count;
+      }
+      // 3. Bonus: find enclosing class for each candidate method
+      //    (a method on a widely-extended class is more likely what the user wants)
+      const classRows = await executeParameterized(repo.lbugPath, `
+        MATCH (cls)-[r:CodeRelation {type: 'HAS_METHOD'}]->(n)
+        WHERE n.id IN $ids
+        RETURN n.id AS methodId, cls.id AS classId, cls.name AS className
+      `, { ids });
+      const classIdByMethod = new Map<string, { id: string; name: string }>();
+      for (const r of classRows) {
+        classIdByMethod.set((r.methodId ?? r[0]) as string, {
+          id: (r.classId ?? r[1]) as string,
+          name: (r.className ?? r[2]) as string,
+        });
+      }
+      // 4. Get EXTENDS count for enclosing classes (more subclasses = more important)
+      const classIds = [...new Set([...classIdByMethod.values()].map((c) => c.id))].filter(Boolean);
+      const extendsCountByClass = new Map<string, number>();
+      if (classIds.length > 0) {
+        const extendsRows = await executeParameterized(repo.lbugPath, `
+          MATCH (sub)-[r:CodeRelation {type: 'EXTENDS'}]->(cls)
+          WHERE cls.id IN $classIds
+          RETURN cls.id AS id, COUNT(r) AS extendsCount
+        `, { classIds });
+        for (const r of extendsRows) {
+          extendsCountByClass.set((r.id ?? r[0]) as string, Number(r.extendsCount ?? r[1]));
+        }
+      }
+      let maxExtends = 0;
+      for (const count of extendsCountByClass.values()) {
+        if (count > maxExtends) maxExtends = count;
+      }
+      // 5. Adjust scores
+      for (const c of scored) {
+        // Normalised inbound CALLS bonus: 0 to 0.15
+        const inbound = inboundByNode.get(c.id) || 0;
+        if (maxInbound > 0) {
+          c.score += (inbound / maxInbound) * 0.15;
+        }
+        // Enclosing-class EXTENDS bonus: 0 to 0.05
+        // A base class with many subclasses is more "important"
+        const classInfo = classIdByMethod.get(c.id);
+        if (classInfo && maxExtends > 0) {
+          const extendsCount = extendsCountByClass.get(classInfo.id) || 0;
+          c.score += (extendsCount / maxExtends) * 0.05;
+        }
+      }
+      // 6. Cap at 1.0
+      for (const c of scored) {
+        c.score = Math.min(1.0, c.score);
+      }
+      // 7. Re-sort: score desc → shorter filePath → id localeCompare
+      scored.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        const fpA = (a.filePath || '').length;
+        const fpB = (b.filePath || '').length;
+        if (fpA !== fpB) return fpA - fpB;
+        return String(a.id).localeCompare(String(b.id));
+      });
+    } catch {
+      /* best-effort — downstream resolvers still work with base scores */
+    }
+  }
+
+  /**
    * Shared symbol resolver used by `context` and `impact`.
    *
    * Returns one of:
@@ -3016,6 +3197,10 @@ export class LocalBackend {
       return String(a.id).localeCompare(String(b.id));
     });
 
+    // Enrich scores with graph-based signals (inbound edges, class importance,
+    // file-path depth) so disambiguation is meaningful without hints.
+    await this.enrichCandidateScores(repo, scored);
+
     // Confident single-result: top score ≥ 0.95 AND beats runner-up by a
     // clear margin. This lets a very strong file_path/kind hint resolve
     // cleanly instead of forcing the caller through a disambiguation
@@ -3117,17 +3302,31 @@ export class LocalBackend {
     const resolvedLabel = outcome.resolvedLabel;
     const symId = sym.id;
 
-    // Categorized incoming refs
-    const incomingRows = await executeParameterized(
-      repo.lbugPath,
-      `
-      MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
-      RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
-      LIMIT 30
-    `,
-      { symId },
-    );
+    // Categorized incoming refs — split CALLS from other types to avoid
+    // LIMIT 30 truncating callers when there are many incoming edges.
+    const [callsIncoming, otherIncoming] = await Promise.all([
+      executeParameterized(
+        repo.lbugPath,
+        `
+        MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
+        WHERE r.type = 'CALLS'
+        RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
+        LIMIT 200
+      `,
+        { symId },
+      ),
+      executeParameterized(
+        repo.lbugPath,
+        `
+        MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
+        WHERE r.type IN ['IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
+        RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
+        LIMIT 100
+      `,
+        { symId },
+      ),
+    ]);
+    const incomingRows = [...callsIncoming, ...otherIncoming];
     let typedPropertyRows: any[] = [];
 
     // Fix #480: Class/Interface nodes have no direct CALLS/IMPORTS edges —
@@ -3173,7 +3372,7 @@ export class LocalBackend {
             MATCH (caller)-[r:CodeRelation]->(ctor)
             WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'ACCESSES']
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
-            LIMIT 30
+            LIMIT 200
           `,
               { symId },
             ),
@@ -3185,7 +3384,7 @@ export class LocalBackend {
             MATCH (caller)-[r:CodeRelation]->(f)
             WHERE r.type IN ['CALLS', 'IMPORTS']
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
-            LIMIT 30
+            LIMIT 100
           `,
               { symId },
             ),
@@ -3199,7 +3398,7 @@ export class LocalBackend {
             MATCH (caller)-[r:CodeRelation]->(p)
             WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'ACCESSES']
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
-            LIMIT 30
+            LIMIT 100
           `,
               {
                 name: sym.name,
@@ -3245,14 +3444,14 @@ export class LocalBackend {
       }
     }
 
-    // Categorized outgoing refs
+    // Categorized outgoing refs — raise LIMIT to match incoming fix
     const outgoingRows = await executeParameterized(
       repo.lbugPath,
       `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
       WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
       RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
-      LIMIT 30
+      LIMIT 200
     `,
       { symId },
     );
@@ -4406,9 +4605,69 @@ export class LocalBackend {
       line: number;
       old_text: string;
       new_text: string;
-      confidence: 'graph' | 'text_search';
+      confidence: 'graph' | 'text_search' | 'oc_precise';
     };
     const escapedOldName = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // Fetch ALL incoming CALLS refs directly from graph (bypass context()'s
+    // LIMIT 30 which truncates callers). Also fetch reason strings which contain
+    // the precise call expression for OC methods.
+    // Note: context() returns uid (not id) as the symbol identifier.
+    const symId = (sym as any).uid || sym.id;
+    let fullIncomingCalls: any[] = [];
+    try {
+      fullIncomingCalls = await executeParameterized(
+        repo.lbugPath,
+        `
+        MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
+        WHERE r.type = 'CALLS'
+        RETURN caller.id AS uid, caller.name AS name, caller.filePath AS filePath,
+               labels(caller)[0] AS kind, caller.startLine AS callerStartLine,
+               r.reason AS reason
+        `,
+        { symId },
+      );
+    } catch (e) {
+      logQueryError('rename:full-incoming-calls', e);
+      // Fallback to context's incoming calls
+      fullIncomingCalls = (lookupResult.incoming.calls || []).map((c: any) => ({
+        uid: c.uid,
+        name: c.name,
+        filePath: c.filePath,
+        kind: c.kind,
+        callerStartLine: c.startLine || c.line,
+        reason: '',
+      }));
+    }
+
+    // Determine the receiver class name for OC method renames.
+    // OC symbol UIDs use format: "Method:path:ClassName.methodName"
+    // e.g. "Method:src/MyClass.m:MyClass.sharedManager"
+    let ocReceiverClass = '';
+    const uidStr = (sym as any).uid || sym.id || '';
+    // Extract class from UID: "ClassName.methodName" -> "ClassName"
+    const dotIdx = uidStr.lastIndexOf(':');
+    if (dotIdx >= 0) {
+      const afterColon = uidStr.substring(dotIdx + 1);
+      const dotPos = afterColon.indexOf('.');
+      if (dotPos > 0) {
+        ocReceiverClass = afterColon.substring(0, dotPos);
+      }
+    }
+    // Fallback: extract from file name
+    if (!ocReceiverClass && sym.filePath) {
+      const baseName = path.basename(sym.filePath, path.extname(sym.filePath));
+      if (baseName.includes('+')) {
+        ocReceiverClass = baseName.split('+')[0];
+      } else {
+        ocReceiverClass = baseName;
+      }
+    }
+
+    // Detect if this is an OC method
+    const isOcMethod =
+      ((sym as any).kind === 'Method' || sym.type === 'Method') &&
+      (sym.filePath?.endsWith('.m') || sym.filePath?.endsWith('.mm') || !!ocReceiverClass);
 
     // Classify each file to rewrite by how it was discovered. Definition and
     // graph-ref files carry graph confidence; files found only by text search
@@ -4419,64 +4678,88 @@ export class LocalBackend {
       fileConfidence.set(sym.filePath, 'graph');
     }
 
-    // All incoming refs from graph (callers, importers, etc.)
-    const allIncoming = [
-      ...(lookupResult.incoming.calls || []),
+    for (const ref of fullIncomingCalls) {
+      if (ref.filePath) {
+        fileConfidence.set(ref.filePath, 'graph');
+      }
+    }
+
+    const otherIncoming = [
       ...(lookupResult.incoming.imports || []),
       ...(lookupResult.incoming.extends || []),
       ...(lookupResult.incoming.implements || []),
     ];
-    for (const ref of allIncoming) {
+    for (const ref of otherIncoming) {
       if (ref.filePath) {
         fileConfidence.set(ref.filePath, 'graph');
       }
     }
 
     // Text search for files the graph might have missed entirely.
-    try {
-      const { execFileSync } = await import('child_process');
-      const rgArgs = [
-        '-l',
-        '--type-add',
-        'code:*.{ts,tsx,js,jsx,py,go,rs,java,c,h,cpp,cc,cxx,hpp,hxx,hh,cs,php,swift}',
-        '-t',
-        'code',
-        `\\b${oldName}\\b`,
-        '.',
-      ];
-      const output = execFileSync('rg', rgArgs, {
-        cwd: repo.repoPath,
-        encoding: 'utf-8',
-        timeout: 5000,
-        // Avoid ENOBUFS on large repos: rg -l can list many files.
-        maxBuffer: 256 * 1024 * 1024,
-        windowsHide: true,
-      });
-      const files = output
-        .trim()
-        .split('\n')
-        .filter((f) => f.length > 0);
+    // For OC methods, skip text_search entirely to avoid false positives
+    // (same-named methods on different classes are too common in OC).
+    if (!isOcMethod || !ocReceiverClass) {
+      try {
+        const { execFileSync } = await import('child_process');
+        const rgArgs = [
+          '-l',
+          '--type-add',
+          'code:*.{ts,tsx,js,jsx,py,go,rs,java,c,h,cpp,cc,cxx,hpp,hxx,hh,cs,php,swift}',
+          '-t',
+          'code',
+          `\\b${oldName}\\b`,
+          '.',
+        ];
+        const output = execFileSync('rg', rgArgs, {
+          cwd: repo.repoPath,
+          encoding: 'utf-8',
+          timeout: 5000,
+          // Avoid ENOBUFS on large repos: rg -l can list many files.
+          maxBuffer: 256 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const files = output
+          .trim()
+          .split('\n')
+          .filter((f) => f.length > 0);
 
-      for (const file of files) {
-        const normalizedFile = file.replace(/\\/g, '/').replace(/^\.\//, '');
-        // Never downgrade a graph-classified file to text_search.
-        if (!fileConfidence.has(normalizedFile)) {
-          fileConfidence.set(normalizedFile, 'text_search');
+        for (const file of files) {
+          const normalizedFile = file.replace(/\\/g, '/').replace(/^\.\//, '');
+          // Never downgrade a graph-classified file to text_search.
+          if (!fileConfidence.has(normalizedFile)) {
+            fileConfidence.set(normalizedFile, 'text_search');
+          }
         }
+      } catch (e) {
+        logQueryError('rename:ripgrep', e);
       }
-    } catch (e) {
-      logQueryError('rename:ripgrep', e);
     }
 
-    // Enumerate every `\boldName\b` line in each file to rewrite, so the previewed
-    // file set is exactly the set the apply loop below rewrites. A file with no
-    // matching line is dropped (apply would write nothing to it). `wordTest`
-    // (non-global) probes each line; `wordReplace` (global) rewrites it and is
-    // reused by the apply loop — compiled once each rather than once per line,
-    // and one escaping formula serves both passes.
+    // Build a set of files that contain OC method calls, plus a regex for the
+    // precise receiver-prefixed call pattern.
+    const ocCallFiles = new Set<string>();
+    let ocPreciseReplace: RegExp | null = null;
+    let ocPreciseTest: RegExp | null = null;
+    if (isOcMethod && ocReceiverClass) {
+      const escapedReceiver = ocReceiverClass.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      ocPreciseTest = new RegExp(`\\[${escapedReceiver}\\s+${escapedOldName}\\b`);
+      ocPreciseReplace = new RegExp(`\\[${escapedReceiver}\\s+${escapedOldName}\\b`, 'g');
+      for (const ref of fullIncomingCalls) {
+        if (ref.filePath) {
+          ocCallFiles.add(ref.filePath);
+        }
+      }
+    }
+
+    // Enumerate every line the apply step will rewrite. `wordTest` (non-global)
+    // probes each line; `wordReplace` (global) rewrites it and is reused by the
+    // apply loop. For OC method calls, only lines matching the precise receiver
+    // pattern are rewritten, to avoid renaming same-named methods on different
+    // classes. For OC definition files, only the definition line is rewritten.
     const wordTest = new RegExp(`\\b${escapedOldName}\\b`);
     const wordReplace = new RegExp(`\\b${escapedOldName}\\b`, 'g');
     const changes = new Map<string, { file_path: string; edits: RenameEdit[] }>();
+    const definitionFilePath = sym.filePath ?? null;
 
     for (const [filePath, confidence] of fileConfidence) {
       try {
@@ -4484,13 +4767,44 @@ export class LocalBackend {
         const lines = content.split('\n');
         const edits: RenameEdit[] = [];
         for (let i = 0; i < lines.length; i++) {
-          if (!wordTest.test(lines[i])) {
+          const line = lines[i];
+          // OC precise mode for caller files: only rewrite the exact receiver call.
+          if (
+            isOcMethod &&
+            ocReceiverClass &&
+            ocCallFiles.has(filePath) &&
+            ocPreciseTest &&
+            ocPreciseReplace &&
+            ocPreciseTest.test(line)
+          ) {
+            edits.push({
+              line: i + 1,
+              old_text: line.trim(),
+              new_text: line.replace(ocPreciseReplace, `[${ocReceiverClass} ${new_name}`).trim(),
+              confidence: 'oc_precise',
+            });
+            continue;
+          }
+          // OC definition file: only rewrite the definition line to avoid touching
+          // unrelated same-named methods on other classes in the same .m/.mm file.
+          if (isOcMethod && ocReceiverClass && filePath === definitionFilePath) {
+            if (i + 1 !== sym.startLine) continue;
+            if (!wordTest.test(line)) continue;
+            edits.push({
+              line: i + 1,
+              old_text: line.trim(),
+              new_text: line.replace(wordReplace, new_name).trim(),
+              confidence,
+            });
+            continue;
+          }
+          if (!wordTest.test(line)) {
             continue;
           }
           edits.push({
             line: i + 1,
-            old_text: lines[i].trim(),
-            new_text: lines[i].replace(wordReplace, new_name).trim(),
+            old_text: line.trim(),
+            new_text: line.replace(wordReplace, new_name).trim(),
             confidence,
           });
         }
@@ -4509,7 +4823,32 @@ export class LocalBackend {
         try {
           const fullPath = assertSafePath(change.file_path);
           const content = await fs.readFile(fullPath, 'utf-8');
-          await fs.writeFile(fullPath, content.replace(wordReplace, new_name), 'utf-8');
+          let newContent: string;
+          const hasOcPrecise = change.edits.some((e) => e.confidence === 'oc_precise');
+          const isOcDefinitionFile =
+            isOcMethod && ocReceiverClass && change.file_path === definitionFilePath;
+          if (hasOcPrecise || isOcDefinitionFile) {
+            // Apply line-by-line for files with OC precise edits or the OC
+            // definition line so receiver-only replacements do not touch
+            // unrelated same-name symbols.
+            const lines = content.split('\n');
+            for (const edit of change.edits) {
+              const lineIdx = edit.line - 1;
+              if (lineIdx < 0 || lineIdx >= lines.length) continue;
+              if (edit.confidence === 'oc_precise' && ocPreciseReplace && ocReceiverClass) {
+                lines[lineIdx] = lines[lineIdx].replace(
+                  ocPreciseReplace,
+                  `[${ocReceiverClass} ${new_name}`,
+                );
+              } else {
+                lines[lineIdx] = lines[lineIdx].replace(wordReplace, new_name);
+              }
+            }
+            newContent = lines.join('\n');
+          } else {
+            newContent = content.replace(wordReplace, new_name);
+          }
+          await fs.writeFile(fullPath, newContent, 'utf-8');
         } catch (e) {
           // A swallowed write failure must not be reported as success (#2283):
           // record the file so the result degrades to 'partial'.
@@ -4527,17 +4866,20 @@ export class LocalBackend {
     }
 
     // Counts derive from the reported set (dry-run: every enumerated file;
-    // apply: only files that landed), so the graph/text_search split always
-    // sums to total_edits and never overstates a partial apply.
+    // apply: only files that landed), so the confidence split always sums to
+    // total_edits and never overstates a partial apply.
     const reported = Array.from(changes.values());
     let graphEdits = 0;
     let astSearchEdits = 0;
+    let ocPreciseEdits = 0;
     for (const change of reported) {
       for (const edit of change.edits) {
         if (edit.confidence === 'graph') {
           graphEdits++;
-        } else {
+        } else if (edit.confidence === 'text_search') {
           astSearchEdits++;
+        } else {
+          ocPreciseEdits++;
         }
       }
     }
@@ -4547,7 +4889,7 @@ export class LocalBackend {
       old_name: oldName,
       new_name,
       files_affected: reported.length,
-      total_edits: graphEdits + astSearchEdits,
+      total_edits: graphEdits + astSearchEdits + ocPreciseEdits,
       graph_edits: graphEdits,
       text_search_edits: astSearchEdits,
       changes: reported,
@@ -5631,14 +5973,31 @@ export class LocalBackend {
     // upstream dependent. The BFS will discover IMPORTS edges on it naturally.
     if (symType === 'Class' || symType === 'Interface') {
       try {
-        // Run both seed queries in parallel — they are independent.
-        const [ctorRows, fileRows] = await Promise.all([
+        // Run all seed queries in parallel — they are independent.
+        // Improvement #8 (OC): JVM uses :Constructor, but Objective-C/Swift/Python
+        // expose members as :Method nodes (OC's constructor is an init* Method, not
+        // a :Constructor). The original Constructor-only seed returned empty for OC,
+        // so a Class's method CALLS edges were never reached — impact(Class) only
+        // surfaced IMPORTS. Seed :Method members too so non-JVM classes get the same
+        // treatment. Constructor query kept for JVM parity.
+        const [ctorRows, methodRows, fileRows] = await Promise.all([
           executeParameterized(
             repo.lbugPath,
             `
             MATCH (n)-[hm:CodeRelation]->(c:Constructor)
             WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
             RETURN c.id AS id, c.name AS name, labels(c)[0] AS type, c.filePath AS filePath
+          `,
+            { symId },
+          ),
+          // #8: seed Method members for non-JVM languages (OC/Swift/etc.).
+          // These carry the CALLS edges that matter for upstream impact.
+          executeParameterized(
+            repo.lbugPath,
+            `
+            MATCH (n)-[hm:CodeRelation]->(m:Method)
+            WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
+            RETURN m.id AS id, m.name AS name, labels(m)[0] AS type, m.filePath AS filePath
           `,
             { symId },
           ),
@@ -5656,6 +6015,16 @@ export class LocalBackend {
         ]);
 
         for (const r of ctorRows) {
+          const rid = r.id || r[0];
+          if (rid && !visited.has(rid)) {
+            visited.add(rid);
+            frontier.push(rid);
+          }
+        }
+        // #8: seed Method members (OC/Swift/etc.) into the frontier so the
+        // BFS can follow their CALLS edges. Without this, impact(Class) only
+        // surfaced IMPORTS for non-JVM languages.
+        for (const r of methodRows) {
           const rid = r.id || r[0];
           if (rid && !visited.has(rid)) {
             visited.add(rid);
@@ -7162,7 +7531,7 @@ export class LocalBackend {
       repo.lbugPath,
       `
       MATCH (p:Process)
-      WHERE p.label = $processName OR p.heuristicLabel = $processName
+      WHERE p.id = $processName OR p.label = $processName OR p.heuristicLabel = $processName
       RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
       LIMIT 1
     `,

@@ -36,13 +36,16 @@ const EXTENSION_MAP: Record<SupportedLanguages, readonly string[]> = {
     '.cpp',
     '.cc',
     '.cxx',
-    '.h',
+    // NOTE: '.h' intentionally omitted — ambiguous between C/C++ and Objective-C.
+    // It is mapped to ObjectiveC below and disambiguated by content via
+    // isOCHeaderContent() at parse time (see parse-worker).
     '.hpp',
     '.hxx',
     '.hh',
     '.cu',
     '.cuh',
   ],
+  [SupportedLanguages.ObjectiveC]: ['.m', '.mm', '.h'],
   [SupportedLanguages.CSharp]: ['.cs'],
   [SupportedLanguages.Go]: ['.go'],
   [SupportedLanguages.Ruby]: ['.rb', '.rake', '.gemspec'],
@@ -73,6 +76,53 @@ for (const [lang, exts] of Object.entries(EXTENSION_MAP) as [
  */
 export const isBladeTemplateFilename = (filePath: string): boolean =>
   filePath.replace(/\\/g, '/').toLowerCase().endsWith('.blade.php');
+
+/**
+ * Detect if a .h file is an Objective-C header by scanning its content
+ * for OC-specific syntax patterns.
+ *
+ * `.h` is ambiguous: it may be a C/C++ header or an Objective-C header.
+ * The extension map assigns `.h` to ObjectiveC, but at parse time we need a
+ * content-based check to decide whether to route the file through the OC
+ * provider or fall back to C/C++.
+ *
+ * Returns true when OC markers are found, OR when the content is empty/null
+ * (conservative default: treat unknown content as OC so we never silently
+ * drop a header that the extension map already claimed for OC).
+ */
+export const isOCHeaderContent = (content: string | null | undefined): boolean => {
+  if (!content) return true;
+  const OC_MARKERS: readonly RegExp[] = [
+    /@interface\b/,
+    /@implementation\b/,
+    /@protocol\b/,
+    /@class\b/,
+    /@property\b/,
+    /@synthesize\b/,
+    /@dynamic\b/,
+    /@selector\b/,
+    /#import\b/,
+    /IBOutlet\b/,
+    /IBAction\b/,
+    /nonatomic\b/,
+    /retain\b/,
+    /strong\b/,
+    /weak\b/,
+    /copy\b/,
+    /assign\b/,
+    /\bNSString\b/,
+    /\bNSArray\b/,
+    /\bNSDictionary\b/,
+    /\bNSObject\b/,
+    /\bUIColor\b/,
+    /\bUIView\b/,
+    /\bUIViewController\b/,
+  ];
+  for (const marker of OC_MARKERS) {
+    if (marker.test(content)) return true;
+  }
+  return false;
+};
 
 /**
  * Map file extension to SupportedLanguage enum.
@@ -121,6 +171,7 @@ const SYNTAX_MAP: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Dart]: 'dart',
   [SupportedLanguages.Vue]: 'typescript',
   [SupportedLanguages.Cobol]: 'cobol',
+  [SupportedLanguages.ObjectiveC]: 'objectivec',
 } satisfies Record<SupportedLanguages, string>; // Ensure exhaustiveness
 
 /** Non-code file extensions → Prism-compatible syntax identifiers */
